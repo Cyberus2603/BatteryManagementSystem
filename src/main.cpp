@@ -1,10 +1,10 @@
 //Arduino system and I2C libraries
+#include <SPIFFS.h>
 #include <Arduino.h>
 #include <Wire.h>
 #include <sys/random.h>
 
 //Network related libraries
-//#include <WiFi.h>
 #include <WiFiManager.h> //https://github.com/tzapu/WiFiManager
 #include <AsyncTCP.h> //https://github.com/me-no-dev/AsyncTCP
 #include <ESPAsyncWebServer.h> //https://github.com/me-no-dev/ESPAsyncWebServer
@@ -75,22 +75,29 @@ TFT_eSPI tft = TFT_eSPI();  // Invoke library, pins defined in User_Setup.h
 enum ScreenType { General = 0, Detailed = 1, Network = 2, Alarms = 3 } screen_type; // Variable to decide which screen to render - detailed (cells voltages, temperatures) or general (IP, SOC etc.)
 
 // ---------- NETWORK HANDLING DEFINITIONS ----------
-#define FALLBACK_AP_NAME "BMS"
 #define FALLBACK_AP_PASSWORD "1234qwer"
 #define WEB_SERVER_PORT 80
+
+String bms_name = "BMS_";
 
 bool ap_mode = false;
 
 AsyncWebServer server(WEB_SERVER_PORT);
 
 WiFiManager wifi_manager;
-//TODO: Get real data and do save on wifi manager
-WiFiManagerParameter mqtt_server_address("mqtt_server_ip", "MQTT Server IP", "192.168.5.104",20);
-WiFiManagerParameter mqtt_server_port("mqtt_server_port", "MQTT Server Port", "8080", 6);
+
+WiFiManagerParameter mqtt_server_address("mqtt_server_ip", "MQTT Server IP", "",20);
+WiFiManagerParameter mqtt_server_port("mqtt_server_port", "MQTT Server Port", "", 6);
 
 String current_ssid;
 
 WiFiClient self_diag_client;
+
+WiFiClient mqtt_wifi_client;
+MqttClient mqtt_client(mqtt_wifi_client);
+
+bool mqtt_send_data_flag = false;
+hw_timer_t *mqtt_send_data_timer = nullptr;
 
 // ---------- DATABASE ---------- 
 
@@ -115,8 +122,6 @@ struct DB_t {
 
 // ---------- BQ76940 FUNCTIONS ----------
 uint8_t crc8Calc (uint8_t in_crc, uint8_t in_data);
-void initBQ76940();
-void updateVoltages();
 int readRegister(byte address);
 void writeRegister(byte address, byte data);
 
@@ -267,29 +272,49 @@ void setCellBalancingRegisters(int pack_id, byte value) {
   writeRegister(CELLBAL1 + (pack_id - 1), value & B00011111);
 }
 
-//Function to get data from Protect1 register
-byte getProtect1Register() {
-  return (byte)(readRegister(PROTECT1));
+//Function to set RSNS in PROTECT1 register
+void setRSNS(uint8_t value) {
+  writeRegister(PROTECT1, ((value & B00000001) << 7));
 }
 
-//Function to get data from Protect2 register
-byte getProtect2Register() {
-  return (byte)(readRegister(PROTECT2));
+//Function to set SCD_DELAY in PROTECT1 register
+void setSCDDelay(uint8_t value) {
+  writeRegister(PROTECT1, ((value & B00000011) << 3));
 }
 
-//Function to get data from Protect3 register
-byte getProtect3Register() {
-  return (byte)(readRegister(PROTECT3));
+//Function to set SCD_THRESHOLD in PROTECT1 register
+void setSCDThreshold(uint8_t value) {
+  writeRegister(PROTECT1, (value & B00000111));
 }
 
-//Function to get data from OV_TRIP register
-byte getOVTripRegister() {
-  return (byte)(readRegister(OV_TRIP));
+//Function to set OCD_DELAY in PROTECT2 register
+void setOCDDelay(uint8_t value) {
+  writeRegister(PROTECT2, ((value & B00000111) << 4));
 }
 
-//Function to get data from UV_TRIP register
-byte getUVTripRegister() {
-  return (byte)(readRegister(UV_TRIP));
+//Function to set OCD_THRESHOLD in PROTECT2 register
+void setOCDThreshold(uint8_t value) {
+  writeRegister(PROTECT2, (value & B00001111));
+}
+
+//Function to set UV_DELAY in PROTECT3 register
+void setUVDelay(uint8_t value) {
+  writeRegister(PROTECT3, ((value & B00000011) << 6));
+}
+
+//Function to set OV_DELAY in PROTECT3 register
+void setOVDelay(uint8_t value) {
+  writeRegister(PROTECT3, ((value & B00000011) << 4));
+}
+
+//Function to set OV_THRESHOLD in OV_TRIP register
+void setOVThreshold(uint8_t value) {
+  writeRegister(OV_TRIP, value);
+}
+
+//Function to set UV_THRESHOLD in UV_TRIP register
+void setUVThreshold(uint8_t value) {
+  writeRegister(UV_TRIP, value);
 }
 
 //Function called by interrupt on Alert Pin from BQ76940
@@ -513,12 +538,14 @@ void RenderScreen(){
 
       } else {
         // Connection status
-        if (WiFi.status() == WL_CONNECTED) {
+        if (current_ssid != "") {
+          tft.fillRect(1, 1, 318, 48, TFT_BLACK);
           tft.setTextColor(TFT_GREEN, TFT_BLACK);
           tft.setCursor(60,10);
           tft.setTextSize(4);
           tft.print("CONNECTED");
         } else {
+          tft.fillRect(1, 1, 318, 48, TFT_BLACK);
           tft.setTextColor(TFT_RED, TFT_BLACK);
           tft.setCursor(20,10);
           tft.setTextSize(4);
@@ -558,11 +585,13 @@ void RenderScreen(){
         tft.setTextSize(3);
         tft.print("WEB:");
         if (self_diag_client.connect(WiFi.localIP(), WEB_SERVER_PORT)) {
+          tft.fillRect(75, 135, 70, 30, TFT_BLACK);
           tft.setTextColor(TFT_GREEN, TFT_BLACK);
           tft.setCursor(80,140);
           tft.print("OK");
           self_diag_client.stop();
         } else {
+          tft.fillRect(75, 135, 70, 30, TFT_BLACK);
           tft.setTextColor(TFT_RED, TFT_BLACK);
           tft.setCursor(80,140);
           tft.print("OFF");
@@ -573,12 +602,14 @@ void RenderScreen(){
         tft.setCursor(170,140);
         tft.setTextSize(3);
         tft.print("MQTT:");
-        if (false) { //TODO: MQTT diagnostic
+        if (mqtt_client.connected()) {
+          tft.fillRect(255, 135, 70, 30, TFT_BLACK);
           tft.setTextColor(TFT_GREEN, TFT_BLACK);
           tft.setCursor(260,140);
           tft.print("OK");
           self_diag_client.stop();
         } else {
+          tft.fillRect(255, 135, 70, 30, TFT_BLACK);
           tft.setTextColor(TFT_RED, TFT_BLACK);
           tft.setCursor(260,140);
           tft.print("OFF");
@@ -598,7 +629,7 @@ void RenderScreen(){
       break;
     }
     case Alarms: {
-
+      //TODO: Alarms section and handling
       break;
     }
   }
@@ -608,6 +639,10 @@ void RenderScreen(){
 
 String makeJsonDataPack() {
   ArduinoJson6194_F1::DynamicJsonDocument data_pack_obj(1024);
+
+  data_pack_obj["device_name"] = bms_name;
+  data_pack_obj["device_ip"] = WiFi.localIP();
+
   for (int i = 0; i < 15; ++i) {
     data_pack_obj["connected_cells"][i] = CONNECTED_CELLS[i];
   }
@@ -632,21 +667,84 @@ String makeJsonDataPack() {
 String makeJsonSystemOverviewPack() {
   ArduinoJson6194_F1::DynamicJsonDocument data_pack_obj(1024);
 
+  byte system_stat_register_value = (byte)(readRegister(SYS_STAT));
+
+  data_pack_obj["system_stat_cc_ready"] = (uint8_t)((system_stat_register_value & B10000000) >> 7);
+  data_pack_obj["system_stat_device_xready"] = (uint8_t)((system_stat_register_value & B00100000) >> 5);
+  data_pack_obj["system_stat_ovrd_alert"] = (uint8_t)((system_stat_register_value & B00010000) >> 4);
+
+  data_pack_obj["system_stat_uv"] = (uint8_t)((system_stat_register_value & B00001000) >> 3);
+  data_pack_obj["system_stat_ov"] = (uint8_t)((system_stat_register_value & B00000100) >> 2);
+  data_pack_obj["system_stat_scd"] = (uint8_t)((system_stat_register_value & B00000010) >> 1);
+  data_pack_obj["system_stat_ocd"] = (uint8_t)(system_stat_register_value & B00000001);
+
   data_pack_obj["cell_balancing_1"] = getCellBalancingRegisters(1);
   data_pack_obj["cell_balancing_2"] = getCellBalancingRegisters(2);
   data_pack_obj["cell_balancing_3"] = getCellBalancingRegisters(3);
 
-  //TODO: Rest of the registers
+  byte protect1_register_value = (byte)(readRegister(PROTECT1));
+  byte protect2_register_value = (byte)(readRegister(PROTECT2));
+  byte protect3_register_value = (byte)(readRegister(PROTECT3));
+  byte ov_trip_register_value = (byte)(readRegister(OV_TRIP));
+  byte uv_trip_register_value = (byte)(readRegister(UV_TRIP));
+
+  data_pack_obj["protect_1_rsns"] = (uint8_t)((protect1_register_value & B10000000) >> 7);
+  data_pack_obj["protect_1_scd_d"] = (uint8_t)((protect1_register_value & B00011000) >> 3);
+  data_pack_obj["protect_1_scd_t"] = (uint8_t)(protect1_register_value & B00000111);
+
+  data_pack_obj["protect_2_ocd_d"] = (uint8_t)((protect2_register_value & B01110000) >> 4);
+  data_pack_obj["protect_2_ocd_t"] = (uint8_t)(protect2_register_value & B00001111);
+
+  data_pack_obj["protect_3_uv"] = (uint8_t)((protect3_register_value & B11000000) >> 6);
+  data_pack_obj["protect_3_ov"] = (uint8_t)((protect3_register_value & B00110000) >> 4);
+
+  data_pack_obj["ov_trip"] = (uint8_t)(ov_trip_register_value);
+
+  data_pack_obj["uv_trip"] = (uint8_t)(uv_trip_register_value);
 
   String data_str;
   ArduinoJson6194_F1::serializeJson(data_pack_obj, data_str);
   return data_str;
 }
 
+void loadMQTTConfig () {
+  if (SPIFFS.begin(false)) {
+    Serial.println("File system mounted");
+    if (SPIFFS.exists("/config.json")) {
+      File config_file = SPIFFS.open("/config.json", "r");
+      if (config_file) {
+        size_t size = config_file.size();
+        // Allocate a buffer to store contents of the file.
+        std::unique_ptr<char[]> buf(new char[size]);
+
+        config_file.readBytes(buf.get(), size);
+        ArduinoJson6194_F1::DynamicJsonDocument data_pack_obj(1024);
+        ArduinoJson6194_F1::deserializeJson(data_pack_obj, buf.get());
+
+        String ip_str = data_pack_obj["mqtt_ip"];
+        String port_str = data_pack_obj["mqtt_port"];
+
+        Serial.print("Config MQTT Server IP: ");
+        Serial.println(ip_str);
+        Serial.print("Config MQTT Server port_str: ");
+        Serial.println(port_str);
+
+        mqtt_server_address.setValue(ip_str.c_str(), 20);
+        mqtt_server_port.setValue(port_str.c_str(), 6);
+      }
+    } else {
+      Serial.println("Config file doesn't exist");
+    }
+  } else {
+    Serial.println("Failed to mount file system");
+  }
+}
+
+
 void webServerSetup() {
   //Main Page
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-    request->send(200, "text/plain", "BMS Prototype");
+    request->send(200, "text/plain", bms_name);
   });
 
   //Data Page
@@ -668,6 +766,38 @@ void webServerSetup() {
 
 }
 
+void IRAM_ATTR mqttSendDataFlagInterruptFunction() {
+  mqtt_send_data_flag = true;
+}
+
+
+void mqttClientSetup() {
+  String mqtt_ip_str = mqtt_server_address.getValue();
+  String mqtt_port_str = mqtt_server_port.getValue();
+
+  if (mqtt_ip_str.isEmpty()) {
+    Serial.println("MQTT IP Address is empty");
+    return;
+  }
+  if (mqtt_port_str.isEmpty()) {
+    Serial.println("MQTT Port is empty");
+    return;
+  }
+
+  int mqtt_port = std::stoi(mqtt_port_str.c_str());
+
+  if (!mqtt_client.connect(mqtt_ip_str.c_str(), mqtt_port)) {
+    Serial.println("Failed to connect to MQTT broker");
+  }
+
+  mqtt_send_data_timer = timerBegin(0, 80, true);
+  timerAttachInterrupt(mqtt_send_data_timer, &mqttSendDataFlagInterruptFunction, true);
+  timerAlarmWrite(mqtt_send_data_timer, 5000000, true);
+  timerAlarmEnable(mqtt_send_data_timer);
+
+  Serial.println("MQTT Client started");
+}
+
 //This function is called when device fails to connect to wifi and enters config mode
 void configModeFailCallback(WiFiManager *wi_fi_manager) {
   Serial.print("Starting AP with SSID: ");
@@ -679,10 +809,37 @@ void configModeFailCallback(WiFiManager *wi_fi_manager) {
   screen_type = Network;
   ap_mode = true;
   tft.fillScreen(TFT_BLACK);
+  RenderScreen();
 }
 
 //This function is called when config portal closes
 void configModeSaveCallback() {
+  Serial.print("MQTT Server IP: ");
+  Serial.println(mqtt_server_address.getValue());
+  Serial.print("MQTT Server port: ");
+  Serial.println(mqtt_server_port.getValue());
+
+  if (SPIFFS.begin(true)) {
+    Serial.println("File system mounted");
+    File config_file = SPIFFS.open("/config.json", "w");
+    ArduinoJson6194_F1::DynamicJsonDocument data_pack_obj(1024);
+    data_pack_obj["mqtt_ip"] = mqtt_server_address.getValue();
+    data_pack_obj["mqtt_port"] = mqtt_server_port.getValue();
+
+    String config_string;
+
+    ArduinoJson6194_F1::serializeJson(data_pack_obj, config_string);
+
+    config_file.print(config_string);
+
+    Serial.print("Saved config: ");
+    Serial.println(config_string);
+
+    config_file.close();
+  } else {
+    Serial.println("Failed to mount file system");
+  }
+
   ESP.restart();
 }
 
@@ -693,8 +850,10 @@ void wifiSetup() {
   wifi_manager.setAPCallback(configModeFailCallback);
   wifi_manager.setSaveConfigCallback(configModeSaveCallback);
   wifi_manager.setClass("invert"); //Set dark theme to save eyes
+  wifi_manager.addParameter(&mqtt_server_address);
+  wifi_manager.addParameter(&mqtt_server_port);
   wifi_manager.setConfigPortalBlocking(false);
-  bool wifi_result = wifi_manager.autoConnect(FALLBACK_AP_NAME, FALLBACK_AP_PASSWORD);
+  bool wifi_result = wifi_manager.autoConnect(bms_name.c_str(), FALLBACK_AP_PASSWORD);
 
   if(!wifi_result) {
     Serial.println("Failed to connect");
@@ -710,11 +869,24 @@ void wifiSetup() {
   }
 }
 
+
 // ---------- FUNCTION EXECUTED ON SECOND CORE ----------
 
 TaskHandle_t second_core_task;
 
 void secondCoreTaskFunction(void * params) {
+  //Make bms name string from bms MAC address
+  String mac_address_str = WiFi.macAddress();
+
+  //Remove ':' from mac address string
+  mac_address_str.remove(14, 1);
+  mac_address_str.remove(11, 1);
+  mac_address_str.remove(8, 1);
+  mac_address_str.remove(5, 1);
+  mac_address_str.remove(2, 1);
+
+  bms_name += mac_address_str;
+
   //Erase Wi-Fi config if button is press on launch
   if (digitalRead(BUTTON_PIN) == LOW) {
     wifi_manager.erase();
@@ -725,11 +897,27 @@ void secondCoreTaskFunction(void * params) {
 
   if (!ap_mode) {
     //Configure and start web server
+    Serial.println("Starting WEB Sever");
     webServerSetup();
+
+    //Configure and start MQTT Client
+    loadMQTTConfig();
+    Serial.println("Starting MQTT Client");
+    mqttClientSetup();
   }
 
   while (true) {
     wifi_manager.process(); //Process config portal if in AP mode
+
+    if (mqtt_send_data_flag) {
+      String message = makeJsonDataPack();
+      String topic = "BMS/";
+      topic += bms_name;
+      mqtt_client.beginMessage(topic, message.length(), false, 1);
+      mqtt_client.print(message);
+      mqtt_client.endMessage();
+      mqtt_send_data_flag = false;
+    }
   }
 }
 
@@ -758,11 +946,15 @@ void setup() {
   //Attach ALERT pin interrupt flag function
   attachInterrupt(ALERT_PIN, alertFlagSetter, RISING);
 
+  // Initial screen type
+  screen_type = General;
+
+  //Render initial screen
+  RenderScreen();
+
   //Setup network task on second core
   xTaskCreatePinnedToCore(secondCoreTaskFunction, "NetworkTask", 10000, nullptr, 0, &second_core_task, 0);
 
-  // Initial screen type
-  screen_type = General;
 }
 
 void loop() {
