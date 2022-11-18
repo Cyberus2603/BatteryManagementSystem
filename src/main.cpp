@@ -669,6 +669,9 @@ String makeJsonSystemOverviewPack() {
 
   byte system_stat_register_value = (byte)(readRegister(SYS_STAT));
 
+  data_pack_obj["system_ip"] = WiFi.localIP();
+  data_pack_obj["system_mac"] = WiFi.macAddress();
+
   data_pack_obj["system_stat_cc_ready"] = (uint8_t)((system_stat_register_value & B10000000) >> 7);
   data_pack_obj["system_stat_device_xready"] = (uint8_t)((system_stat_register_value & B00100000) >> 5);
   data_pack_obj["system_stat_ovrd_alert"] = (uint8_t)((system_stat_register_value & B00010000) >> 4);
@@ -705,6 +708,45 @@ String makeJsonSystemOverviewPack() {
   String data_str;
   ArduinoJson6194_F1::serializeJson(data_pack_obj, data_str);
   return data_str;
+}
+
+void setChipValues(ArduinoJson6194_F1::DynamicJsonDocument values) {
+  //Guard clauses to check if JSON is correct
+  if (!values.containsKey("cell_balancing_1")) {Serial.println("Error in received chip settings"); return;}
+  if (!values.containsKey("cell_balancing_2")) {Serial.println("Error in received chip settings"); return;}
+  if (!values.containsKey("cell_balancing_3")) {Serial.println("Error in received chip settings"); return;}
+
+  if (!values.containsKey("protect_1_rsns")) {Serial.println("Error in received chip settings"); return;}
+  if (!values.containsKey("protect_1_scd_d")) {Serial.println("Error in received chip settings"); return;}
+  if (!values.containsKey("protect_1_scd_t")) {Serial.println("Error in received chip settings"); return;}
+
+  if (!values.containsKey("protect_2_ocd_d")) {Serial.println("Error in received chip settings"); return;}
+  if (!values.containsKey("protect_2_ocd_t")) {Serial.println("Error in received chip settings"); return;}
+
+  if (!values.containsKey("protect_3_uv")) {Serial.println("Error in received chip settings"); return;}
+  if (!values.containsKey("protect_3_ov")) {Serial.println("Error in received chip settings"); return;}
+
+  if (!values.containsKey("ov_trip")) {Serial.println("Error in received chip settings"); return;}
+  if (!values.containsKey("uv_trip")) {Serial.println("Error in received chip settings"); return;}
+
+  Serial.println("Setting new chip config");
+
+  setCellBalancingRegisters(1, (uint8_t)(values["cell_balancing_1"]));
+  setCellBalancingRegisters(2, (uint8_t)(values["cell_balancing_2"]));
+  setCellBalancingRegisters(3, (uint8_t)(values["cell_balancing_3"]));
+
+  setRSNS((uint8_t)(values["protect_1_rsns"]));
+  setSCDDelay((uint8_t)(values["protect_1_scd_d"]));
+  setSCDThreshold((uint8_t)(values[(uint8_t)(values["protect_1_scd_t"])]));
+
+  setOCDDelay((uint8_t)(values["protect_2_ocd_d"]));
+  setOCDThreshold((uint8_t)(values["protect_2_ocd_t"]));
+
+  setUVDelay((uint8_t)(values["protect_3_uv"]));
+  setOVDelay((uint8_t)(values["protect_3_ov"]));
+
+  setOVThreshold((uint8_t)(values["ov_trip"]));
+  setUVThreshold((uint8_t)(values["uv_trip"]));
 }
 
 void loadMQTTConfig () {
@@ -752,9 +794,20 @@ void webServerSetup() {
     request->send(200, "application/json", makeJsonDataPack());
   });
 
-  //TODO: HTTP_POST on commands
   //Commands page
   server.on("/command", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "application/json", makeJsonSystemOverviewPack());
+  });
+
+  server.on("/command", HTTP_POST, [](AsyncWebServerRequest *request) { },nullptr,
+    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+    String param_string = ((const char*)data);
+
+    ArduinoJson6194_F1::DynamicJsonDocument json_values(1024);
+
+    ArduinoJson6194_F1::deserializeJson(json_values, param_string);
+
+    setChipValues(json_values);
     request->send(200, "application/json", makeJsonSystemOverviewPack());
   });
 
@@ -763,7 +816,6 @@ void webServerSetup() {
   AsyncElegantOTA.begin(&server);
   server.begin();
   Serial.println("HTTP server started");
-
 }
 
 void IRAM_ATTR mqttSendDataFlagInterruptFunction() {
@@ -847,6 +899,7 @@ void wifiSetup() {
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
 
+  wifi_manager.setDebugOutput(false);
   wifi_manager.setAPCallback(configModeFailCallback);
   wifi_manager.setSaveConfigCallback(configModeSaveCallback);
   wifi_manager.setClass("invert"); //Set dark theme to save eyes
