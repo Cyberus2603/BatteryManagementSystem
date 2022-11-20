@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <sys/random.h>
+#include <SNTP.h>
 
 //Network related libraries
 #include <WiFiManager.h> //https://github.com/tzapu/WiFiManager
@@ -67,12 +68,11 @@ bool bq76940_alert = false; //Flag to handle ALERT from BQ76940
 
 // ---------- SCREEN HANDLING DEFINITIONS ---------- 
 
-//Pin definitions for screen and button
 #define BUTTON_PIN 14
 
 TFT_eSPI tft = TFT_eSPI();  // Invoke library, pins defined in User_Setup.h
 
-enum ScreenType { General = 0, Detailed = 1, Network = 2, Alarms = 3 } screen_type; // Variable to decide which screen to render - detailed (cells voltages, temperatures) or general (IP, SOC etc.)
+enum ScreenType { General = 0, Detailed = 1, Network = 2, Alarms = 3, None = 10 } screen_type; // Variable to decide which screen to render
 
 // ---------- NETWORK HANDLING DEFINITIONS ----------
 #define FALLBACK_AP_PASSWORD "1234qwer"
@@ -99,11 +99,40 @@ MqttClient mqtt_client(mqtt_wifi_client);
 bool mqtt_send_data_flag = false;
 hw_timer_t *mqtt_send_data_timer = nullptr;
 
+// ---------- ALARM DEFINITIONS ----------
+
+enum AlarmType { OCD = 0, SCD = 1, OV = 2, UV = 3, OVRD_ALERT = 4, DEVICE_XREADY = 5 };
+
+struct Alarm_Record_t {
+  tm record_time;
+  AlarmType record_type;
+};
+
+std::vector<Alarm_Record_t> alarms_database;
+
+//Counter that tells which alarm in the database will be overwritten
+uint8_t alarms_counter = 0;
+
+//Flag that tells if alarms were send via MQTT
+bool alarms_send = true;
+
+//Variable to hold current system time, incremented via internal timer
+time_t current_time;
+
+//Upon detecting an error a timer starts, when its active all errors are ignored, 60 seconds after timer launch error flags are cleared
+hw_timer_s *error_detection_cooldown_timer = nullptr;
+
+//Timer that internal clock runs on
+hw_timer_s *clock_timer = nullptr;
+
+bool ignore_errors = false;
+bool clear_device_flags = false;
+
 // ---------- DATABASE ---------- 
 
 const float VOLTAGE_DIFFERENCE_THRESHOLD = 0.03; // Value in volts
 const float TEMPERATURE_THRESHOLD = 40.0;
-bool alert_icon_enabled = false;
+bool alarm_icon_enabled = false;
 
 struct DB_t {
   float *cells_voltages = nullptr;
@@ -322,16 +351,97 @@ void IRAM_ATTR alertFlagSetter() {
   bq76940_alert = true;
 }
 
-//Function that handles BQ76940 alerts
-void handleAlert() {
+//Function that tries to clear DEVICE_XREADY flag
+void cleanDeviceFlags() {
+  clear_device_flags = true;
+  ignore_errors = false;
+}
+
+//Auxiliary function to create alarm record in database
+void createAlarmRecord(AlarmType type) {
+  tm now{};
+  localtime_r(&current_time, &now);
+
+  Alarm_Record_t tmp{now, type};
+  alarms_database[alarms_counter] = tmp;
+  alarms_counter = (alarms_counter + 1) % 8;
+}
+
+
+//Function that handles BQ76940 alarms
+void handleAlarm() {
   if (bq76940_alert) {
-    //TODO: Events handling
+    byte system_status = readRegister(SYS_STAT);
+
+    if (!ignore_errors) {
+      //DEVICE_XREADY Error
+      if (system_status & B00100000) {
+        ignore_errors = true;
+
+        createAlarmRecord(DEVICE_XREADY);
+
+        Serial.println("DEVICE_XREADY ERROR");
+      }
+
+      //OVRD_ALERT Error
+      if (system_status & B00010000) {
+        ignore_errors = true;
+
+        createAlarmRecord(OVRD_ALERT);
+
+        Serial.println("OVRD_ALERT ERROR");
+      }
+
+      //UV Error
+      if (system_status & B00001000) {
+        ignore_errors = true;
+
+        createAlarmRecord(UV);
+
+        Serial.println("UV ERROR");
+      }
+
+      //OV Error
+      if (system_status & B00000100) {
+        ignore_errors = true;
+
+        createAlarmRecord(OV);
+
+        Serial.println("OV ERROR");
+      }
+
+      //SCD Error
+      if (system_status & B00000010) {
+        ignore_errors = true;
+
+        createAlarmRecord(SCD);
+
+        Serial.println("SCD ERROR");
+      }
+
+      //OCD Error
+      if (system_status & B00000001) {
+        ignore_errors = true;
+
+        createAlarmRecord(OCD);
+
+        Serial.println("OCD ERROR");
+      }
+
+      if (ignore_errors) {
+        alarm_icon_enabled = true;
+        alarms_send = false;
+        timerAlarmEnable(error_detection_cooldown_timer);
+      }
+    }
+
     bq76940_alert = false;
   }
 }
 
 // ---------- SCREEN HANDLING FUNCTIONS ---------- 
 
+//Calculate and format data to print on display
 void calculateParameters() {
   for ( int i = 0; i < conn_cells ; i++ ) {
     database.cells_voltages[i] = (float)(cell_voltages[i] / 1000.0);
@@ -352,6 +462,7 @@ void calculateParameters() {
   database.battery_is_charging = (charge_current >= 0);
 }
 
+//Function that renders screens on display and appropriate data on them
 void RenderScreen(){
   switch (screen_type) {
     case General: {
@@ -438,7 +549,7 @@ void RenderScreen(){
       }
 
       // Alarm indicator
-      if (alert_icon_enabled) {
+      if (alarm_icon_enabled) {
         tft.drawCircle(295,88, 20, TFT_RED);
         tft.fillRect(293, 73, 5, 20, TFT_RED);
         tft.fillRect(293, 98, 5, 5, TFT_RED);
@@ -629,7 +740,64 @@ void RenderScreen(){
       break;
     }
     case Alarms: {
-      //TODO: Alarms section and handling
+      alarm_icon_enabled = false;
+
+      //Draws error records on display
+      for (int i = 0; i < 8; ++i) {
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        tft.setCursor( 3,(int16_t)((21 * i) + 4));
+        tft.setTextSize(2);
+        switch (alarms_database[i].record_type) {
+          case OCD: {
+            tft.print("OCD ERROR");
+            break;
+          }
+          case SCD: {
+            tft.print("SCD ERROR");
+            break;
+          }
+          case OV: {
+            tft.print("OV ERROR");
+            break;
+          }
+          case UV: {
+            tft.print("UV ERROR");
+            break;
+          }
+          case OVRD_ALERT: {
+            tft.print("OVRD ERROR");
+            break;
+          }
+          case DEVICE_XREADY: {
+            tft.print("XREADY ERROR");
+            break;
+          }
+          default: {
+            continue;
+          }
+        }
+
+        char time_char_array[64];
+        strftime(time_char_array, sizeof(time_char_array), "%T %d/%m/%G", &alarms_database[i].record_time);
+        String time_str = time_char_array;
+
+        tft.setCursor( 200,(int16_t)((21 * i) + 8));
+        tft.setTextSize(1);
+        tft.print(time_str);
+      }
+
+
+      // --- Rows and column lines ---
+      uint FRAME_COLOR = TFT_DARKGREY;
+      //X lines
+      for (int i = 0; i < 8; ++i) {
+        tft.drawLine(0, 21 * i, 319, 21 * i, FRAME_COLOR);
+      }
+      tft.drawLine(0, 0, 319, 0, FRAME_COLOR);
+      tft.drawLine(0, 169, 319, 169, FRAME_COLOR);
+      // Y lines
+      tft.drawLine(0, 0, 0, 169, FRAME_COLOR);
+      tft.drawLine(319, 0, 319, 169, FRAME_COLOR);
       break;
     }
   }
@@ -637,6 +805,7 @@ void RenderScreen(){
 
 // ---------- NETWORK HANDLING FUNCTIONS ----------
 
+//Function that packs BMS data (voltages, temperatures, current etc.) into JSON
 String makeJsonDataPack() {
   ArduinoJson6194_F1::DynamicJsonDocument data_pack_obj(1024);
 
@@ -664,11 +833,19 @@ String makeJsonDataPack() {
   return data_str;
 }
 
+//Function that packs BMS system config into JSON
 String makeJsonSystemOverviewPack() {
   ArduinoJson6194_F1::DynamicJsonDocument data_pack_obj(1024);
 
   byte system_stat_register_value = (byte)(readRegister(SYS_STAT));
 
+  tm now{};
+  localtime_r(&current_time, &now);
+  char time_char_array[64];
+  strftime(time_char_array, sizeof(time_char_array), "%T %d/%m/%G", &now);
+  String time_str = time_char_array;
+
+  data_pack_obj["system_time"] = time_str;
   data_pack_obj["system_ip"] = WiFi.localIP();
   data_pack_obj["system_mac"] = WiFi.macAddress();
 
@@ -710,45 +887,118 @@ String makeJsonSystemOverviewPack() {
   return data_str;
 }
 
-void setChipValues(ArduinoJson6194_F1::DynamicJsonDocument values) {
-  //Guard clauses to check if JSON is correct
-  if (!values.containsKey("cell_balancing_1")) {Serial.println("Error in received chip settings"); return;}
-  if (!values.containsKey("cell_balancing_2")) {Serial.println("Error in received chip settings"); return;}
-  if (!values.containsKey("cell_balancing_3")) {Serial.println("Error in received chip settings"); return;}
+//Function that packs alerts into JSON
+String makeJsonAlarmsDataPack() {
+  ArduinoJson6194_F1::DynamicJsonDocument data_pack_obj(1024);
 
-  if (!values.containsKey("protect_1_rsns")) {Serial.println("Error in received chip settings"); return;}
-  if (!values.containsKey("protect_1_scd_d")) {Serial.println("Error in received chip settings"); return;}
-  if (!values.containsKey("protect_1_scd_t")) {Serial.println("Error in received chip settings"); return;}
+  for (int i = 0; i < 8; ++i) {
+    switch (alarms_database[i].record_type) {
+      case OCD: {
+        data_pack_obj[i]["error_type"] = "OCD ERROR";
+        break;
+      }
+      case SCD: {
+        data_pack_obj[i]["error_type"] = "SCD ERROR";
+        break;
+      }
+      case OV: {
+        data_pack_obj[i]["error_type"] = "OV ERROR";
+        break;
+      }
+      case UV: {
+        data_pack_obj[i]["error_type"] = "UV ERROR";
+        break;
+      }
+      case OVRD_ALERT: {
+        data_pack_obj[i]["error_type"] = "OVRD ERROR";
+        break;
+      }
+      case DEVICE_XREADY: {
+        data_pack_obj[i]["error_type"] = "XREADY ERROR";
+        break;
+      }
+      default: {
+        continue;
+      }
+    }
 
-  if (!values.containsKey("protect_2_ocd_d")) {Serial.println("Error in received chip settings"); return;}
-  if (!values.containsKey("protect_2_ocd_t")) {Serial.println("Error in received chip settings"); return;}
+    char time_char_array[64];
+    strftime(time_char_array, sizeof(time_char_array), "%T %d/%m/%G", &alarms_database[i].record_time);
+    String time_str = time_char_array;
 
-  if (!values.containsKey("protect_3_uv")) {Serial.println("Error in received chip settings"); return;}
-  if (!values.containsKey("protect_3_ov")) {Serial.println("Error in received chip settings"); return;}
+    data_pack_obj[i]["error_timestamp"] = time_str;
+  }
 
-  if (!values.containsKey("ov_trip")) {Serial.println("Error in received chip settings"); return;}
-  if (!values.containsKey("uv_trip")) {Serial.println("Error in received chip settings"); return;}
-
-  Serial.println("Setting new chip config");
-
-  setCellBalancingRegisters(1, (uint8_t)(values["cell_balancing_1"]));
-  setCellBalancingRegisters(2, (uint8_t)(values["cell_balancing_2"]));
-  setCellBalancingRegisters(3, (uint8_t)(values["cell_balancing_3"]));
-
-  setRSNS((uint8_t)(values["protect_1_rsns"]));
-  setSCDDelay((uint8_t)(values["protect_1_scd_d"]));
-  setSCDThreshold((uint8_t)(values[(uint8_t)(values["protect_1_scd_t"])]));
-
-  setOCDDelay((uint8_t)(values["protect_2_ocd_d"]));
-  setOCDThreshold((uint8_t)(values["protect_2_ocd_t"]));
-
-  setUVDelay((uint8_t)(values["protect_3_uv"]));
-  setOVDelay((uint8_t)(values["protect_3_ov"]));
-
-  setOVThreshold((uint8_t)(values["ov_trip"]));
-  setUVThreshold((uint8_t)(values["uv_trip"]));
+  String data_str;
+  ArduinoJson6194_F1::serializeJson(data_pack_obj, data_str);
+  return data_str;
 }
 
+//Function to set config registers on BQ76940
+void setChipValues(ArduinoJson6194_F1::DynamicJsonDocument values) {
+  //Modify only fields from JSON
+  if (values.containsKey("cell_balancing_1")) {
+    Serial.println("Changing \"cell_balancing_1\"");
+    setCellBalancingRegisters(1, (uint8_t)(values["cell_balancing_1"]));
+  }
+
+  if (values.containsKey("cell_balancing_2")) {
+    Serial.println("Changing \"cell_balancing_2\"");
+    setCellBalancingRegisters(2, (uint8_t)(values["cell_balancing_2"]));
+  }
+
+  if (values.containsKey("cell_balancing_3")) {
+    Serial.println("Changing \"cell_balancing_3\"");
+    setCellBalancingRegisters(3, (uint8_t)(values["cell_balancing_3"]));
+  }
+
+  if (values.containsKey("protect_1_rsns")) {
+    Serial.println("Changing \"protect_1_rsns\"");
+    setRSNS((uint8_t)(values["protect_1_rsns"]));
+  }
+
+  if (values.containsKey("protect_1_scd_d")) {
+    Serial.println("Changing \"protect_1_scd_d\"");
+    setSCDDelay((uint8_t)(values["protect_1_scd_d"]));
+  }
+
+  if (values.containsKey("protect_1_scd_t")) {
+    Serial.println("Changing \"protect_1_scd_t\"");
+    setSCDThreshold((uint8_t)(values[(uint8_t)(values["protect_1_scd_t"])]));
+  }
+
+  if (values.containsKey("protect_2_ocd_d")) {
+    Serial.println("Changing \"protect_2_ocd_d\"");
+    setOCDDelay((uint8_t)(values["protect_2_ocd_d"]));
+  }
+
+  if (values.containsKey("protect_2_ocd_t")) {
+    Serial.println("Changing \"protect_2_ocd_t\"");
+    setOCDThreshold((uint8_t)(values["protect_2_ocd_t"]));
+  }
+
+  if (values.containsKey("protect_3_uv")) {
+    Serial.println("Changing \"protect_3_uv\"");
+    setUVDelay((uint8_t)(values["protect_3_uv"]));
+  }
+
+  if (values.containsKey("protect_3_ov")) {
+    Serial.println("Changing \"protect_3_ov\"");
+    setOVDelay((uint8_t)(values["protect_3_ov"]));
+  }
+
+  if (values.containsKey("ov_trip")) {
+    Serial.println("Changing \"ov_trip\"");
+    setOVThreshold((uint8_t)(values["ov_trip"]));
+  }
+
+  if (values.containsKey("uv_trip")) {
+    Serial.println("Changing \"uv_trip\"");
+    setUVThreshold((uint8_t)(values["uv_trip"]));
+  }
+}
+
+//Function that restores saved MQTT config from Flash memory
 void loadMQTTConfig () {
   if (SPIFFS.begin(false)) {
     Serial.println("File system mounted");
@@ -782,7 +1032,7 @@ void loadMQTTConfig () {
   }
 }
 
-
+//Function that sets up web server paths with appropriate request functionality
 void webServerSetup() {
   //Main Page
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -811,6 +1061,11 @@ void webServerSetup() {
     request->send(200, "application/json", makeJsonSystemOverviewPack());
   });
 
+  //Alarms page
+  server.on("/alarms", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "application/json", makeJsonAlarmsDataPack());
+  });
+
   //TODO: DEBUG WHY OTA DOESNT WORK
   //Start ElegantOTA - starts on "/update"
   AsyncElegantOTA.begin(&server);
@@ -818,11 +1073,12 @@ void webServerSetup() {
   Serial.println("HTTP server started");
 }
 
+//Interrupt function called by timer to tell ESP to send data to MQTT broker
 void IRAM_ATTR mqttSendDataFlagInterruptFunction() {
   mqtt_send_data_flag = true;
 }
 
-
+//Function to initialize and setup MQTT Client
 void mqttClientSetup() {
   String mqtt_ip_str = mqtt_server_address.getValue();
   String mqtt_port_str = mqtt_server_port.getValue();
@@ -895,6 +1151,7 @@ void configModeSaveCallback() {
   ESP.restart();
 }
 
+//This function connects to Wi-Fi, if connecting fails then AP is started with config website
 void wifiSetup() {
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
@@ -925,8 +1182,14 @@ void wifiSetup() {
 
 // ---------- FUNCTION EXECUTED ON SECOND CORE ----------
 
+//Function to increment time clock
+void incrementClock() {
+  current_time += 1;
+}
+
 TaskHandle_t second_core_task;
 
+//Function that runs on second ESP core, handles network stuff
 void secondCoreTaskFunction(void * params) {
   //Make bms name string from bms MAC address
   String mac_address_str = WiFi.macAddress();
@@ -949,6 +1212,30 @@ void secondCoreTaskFunction(void * params) {
   wifiSetup();
 
   if (!ap_mode) {
+    //Set timezone than connect to NTP server and get current time
+    time(&current_time);
+    setenv("PL", "GMT+1", 1);
+    tzset();
+
+    sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    sntp_setservername(0, "pool.ntp.org");
+    sntp_set_sync_mode(SNTP_SYNC_MODE_IMMED);
+    sntp_set_sync_interval(3600000);
+    sntp_init();
+
+    tm now{};
+    localtime_r(&current_time, &now);
+    char time_str[64];
+    strftime(time_str, sizeof(time_str), "%T %d/%m/%G", &now);
+    Serial.print("Current time: ");
+    Serial.println(time_str);
+
+    //Timer that internal clock runs on, increments "current_time" every 1 sec
+    clock_timer = timerBegin(2, 80, true);
+    timerAttachInterrupt(clock_timer, &incrementClock, true);
+    timerAlarmWrite(clock_timer, 1000000, true);
+    timerAlarmEnable(clock_timer);
+
     //Configure and start web server
     Serial.println("Starting WEB Sever");
     webServerSetup();
@@ -970,6 +1257,15 @@ void secondCoreTaskFunction(void * params) {
       mqtt_client.print(message);
       mqtt_client.endMessage();
       mqtt_send_data_flag = false;
+      if (!alarms_send) {
+        String alarms_message = makeJsonAlarmsDataPack();
+        String alarms_topic = "BMS_ALARMS/";
+        alarms_topic += bms_name;
+        mqtt_client.beginMessage(alarms_topic, alarms_message.length(), false, 1);
+        mqtt_client.print(alarms_message);
+        mqtt_client.endMessage();
+        alarms_send = true;
+      }
     }
   }
 }
@@ -996,8 +1292,21 @@ void setup() {
   database.cells_voltages = new float[conn_cells];
   database.temperatures = new float[THERMISTORS_COUNT];
 
+  //Reserve 8 spots in alarms database and fill them with empty records
+  alarms_database.reserve(8);
+  Alarm_Record_t tmp{};
+  tmp.record_type = (AlarmType)(None);
+  for (int i = 0; i < 8; ++i) {
+    alarms_database[i] = tmp;
+  }
+
   //Attach ALERT pin interrupt flag function
   attachInterrupt(ALERT_PIN, alertFlagSetter, RISING);
+
+  //Timer to remove error flags
+  error_detection_cooldown_timer = timerBegin(1, 80, true);
+  timerAttachInterrupt(error_detection_cooldown_timer, &cleanDeviceFlags, true);
+  timerAlarmWrite(error_detection_cooldown_timer, 30000000, true);
 
   // Initial screen type
   screen_type = General;
@@ -1014,7 +1323,15 @@ void loop() {
   updateVoltages(); //Read voltage data from BQ76940
   updateCurrent(); //Read current data from BQ76940
   updateTemperatures(); //Read temperatures from BQ76940
-  handleAlert(); //Check chip and handle alert event from BQ76940
+
+  //Clear error flags if one occurred in the past
+  if (clear_device_flags) {
+    writeRegister(SYS_STAT, B00111111);
+    timerAlarmDisable(error_detection_cooldown_timer);
+    clear_device_flags = false;
+  }
+
+  handleAlarm(); //Check chip and handle alert event from BQ76940
 
   //Screen switch
   if (digitalRead(BUTTON_PIN) == LOW) {
