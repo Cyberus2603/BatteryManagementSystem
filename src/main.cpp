@@ -674,21 +674,21 @@ void RenderScreen(){
 
         //IP
         tft.setTextColor(TFT_WHITE, TFT_BLACK);
-        tft.setCursor(75,85);
+        tft.setCursor(80,85);
         tft.setTextSize(2);
         tft.print("IP:");
         tft.setTextColor(TFT_BLUE, TFT_BLACK);
         tft.setCursor(115,85);
         tft.print(WiFi.localIP());
 
-        //MAC
+        //MQTT IP
         tft.setTextColor(TFT_WHITE, TFT_BLACK);
-        tft.setCursor(40,110);
+        tft.setCursor(50,110);
         tft.setTextSize(2);
-        tft.print("MAC:");
+        tft.print("MQTT IP:");
         tft.setTextColor(TFT_BLUE, TFT_BLACK);
-        tft.setCursor(90,110);
-        tft.print(WiFi.macAddress());
+        tft.setCursor(145,110);
+        tft.print(mqtt_server_address.getValue());
 
         //WEB Self diagnostic
         tft.setTextColor(TFT_WHITE, TFT_BLACK);
@@ -1036,6 +1036,7 @@ void loadMQTTConfig () {
 void webServerSetup() {
   //Main Page
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    //TODO: Tables with data
     request->send(200, "text/plain", bms_name);
   });
 
@@ -1063,6 +1064,15 @@ void webServerSetup() {
 
   //Alarms page
   server.on("/alarms", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "application/json", makeJsonAlarmsDataPack());
+  });
+
+  server.on("/alarms", HTTP_POST, [](AsyncWebServerRequest *request) {
+    Alarm_Record_t tmp{};
+    tmp.record_type = (AlarmType)(None);
+    for (int i = 0; i < 8; ++i) {
+      alarms_database[i] = tmp;
+    }
     request->send(200, "application/json", makeJsonAlarmsDataPack());
   });
 

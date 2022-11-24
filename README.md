@@ -40,7 +40,7 @@ Voltage of the entire battery, voltage on individual cells, current send to MQTT
 - Connection state
 - SSID of the connected Wi-Fi
 - IP of the device
-- MAC address of the device
+- IP of toe MQTT server that ESP32 connects to
 - HTTP status
 - MQTT status
 
