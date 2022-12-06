@@ -15,9 +15,9 @@ This project should run out of the box in Arduino IDE after installing libraries
 On initial device startup ESP32 creates AP to connect to. After accessing its IP via browser you can configure your production/home Wi-Fi SSID and Password as well as MQTT server and port.
 
 #### HTTP based communication via JSON:
-- data reading (http://<IP>/data) - voltage of the entire battery, voltage on individual cells, current
-- management (http://<IP>/command) - reading and setting overvoltage protection, undervoltage protection, cells balancing
-- alarms (http://<IP>/alarms) - reading alarms log
+- data reading (http://\<IP>/data) - voltage of the entire battery, voltage on individual cells, current
+- management (http://\<IP>/command) - reading and setting overvoltage protection, undervoltage protection, cells balancing
+- alarms (http://\<IP>/alarms) - reading alarms log
 
 
 #### MQTT based data collection
