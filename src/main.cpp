@@ -3,7 +3,6 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <sys/random.h>
-#include <SNTP.h>
 
 //Network related libraries
 #include <WiFiManager.h> //https://github.com/tzapu/WiFiManager
@@ -12,6 +11,8 @@
 #include <AsyncElegantOTA.h> //https://github.com/ayushsharma82/AsyncElegantOTA
 #include <ArduinoJson.h>  //https://github.com/bblanchon/ArduinoJson
 #include <ArduinoMqttClient.h> //https://github.com/arduino-libraries/ArduinoMqttClient
+#include <NTPClient.h>  //https://github.com/taranais/NTPClient
+#include <WiFiUdp.h>
 
 //Screen handling libraries
 #include "TFTColors.h"  //File containing color definitions for text
@@ -146,6 +147,7 @@ struct DB_t {
   float state_of_charge = 0.0;
   float charge_current = 0.0;
   float maximum_temp = 0.0;
+  float average_cell_voltage = 0.0;
   bool battery_is_charging = true;
 } database;
 
@@ -443,9 +445,13 @@ void handleAlarm() {
 
 //Calculate and format data to print on display
 void calculateParameters() {
+  database.average_cell_voltage = 0.0;
   for ( int i = 0; i < conn_cells ; i++ ) {
     database.cells_voltages[i] = (float)(cell_voltages[i] / 1000.0);
+    database.average_cell_voltage += database.cells_voltages[i];
   }
+  database.average_cell_voltage /= (float)(conn_cells);
+
   database.minV = database.cells_voltages[min_voltage_cell_id];
   database.maxV = database.cells_voltages[max_voltage_cell_id];
   database.sumV = (float)(battery_voltage / 1000.0);
@@ -622,11 +628,11 @@ void RenderScreen(){
 
         //SSID
         tft.setTextColor(TFT_WHITE, TFT_BLACK);
-        tft.setCursor(80,60);
+        tft.setCursor(40,60);
         tft.setTextSize(2);
         tft.print("SSID:");
         tft.setTextColor(TFT_BLUE, TFT_BLACK);
-        tft.setCursor(140,60);
+        tft.setCursor(100,60);
         tft.print(current_ssid);
 
         //PASS
@@ -817,6 +823,10 @@ String makeJsonDataPack() {
   }
   for (int i = 0; i < conn_cells; ++i) {
     data_pack_obj["voltage_data"][i] = database.cells_voltages[i];
+    String tmp = "";
+    if ((database.cells_voltages[i] - database.average_cell_voltage) > 0.0) tmp += '+';
+    tmp += database.cells_voltages[i] - database.average_cell_voltage;
+    data_pack_obj["voltage_delta_from_average"][i] = tmp;
   }
   for (int i = 0; i < THERMISTORS_COUNT; ++i) {
     data_pack_obj["temperatures"][i] = database.temperatures[i];
@@ -824,6 +834,7 @@ String makeJsonDataPack() {
   data_pack_obj["voltage_sum"] = database.sumV;
   data_pack_obj["voltage_min"] = database.minV;
   data_pack_obj["voltage_max"] = database.maxV;
+  data_pack_obj["voltage_average"] = database.average_cell_voltage;
   data_pack_obj["max_cell_difference"] = database.delta;
   data_pack_obj["state_of_charge"] = database.state_of_charge;
   data_pack_obj["charge_current"] = database.charge_current;
@@ -934,6 +945,407 @@ String makeJsonAlarmsDataPack() {
   return data_str;
 }
 
+//Function that creates main site in html
+String makeHTMLMainSite() {
+  String main_site = "<!DOCTYPE html>\n"
+                     "<html>\n"
+                     "<style>\n"
+                     "table, th, td {\n"
+                     "  border:1px solid black;\n"
+                     "}\n"
+                     "</style>"
+                     "<body>\n";
+
+  //BMS name and IP
+  main_site += "<h2>";
+  main_site += bms_name;
+  main_site +="</h2>";
+
+  main_site += "<h3>";
+  main_site += WiFi.localIP().toString();
+  main_site +="</h3>";
+
+  //Calculated params
+  main_site += "<table>";
+  main_site += "<tr>\n"
+               "  <th>Voltage sum</th>\n"
+               "  <th>Minimal Voltage</th>\n"
+               "  <th>Maximal Voltage</th>\n"
+               "  <th>Maximal cell difference</th>\n"
+               "  <th>State of charge</th>\n"
+               "  <th>Charge current</th>\n"
+               "</tr>";
+
+  main_site += "<tr>\n";
+
+  main_site += "<td>";
+  main_site += database.sumV;
+  main_site += " V</td>";
+  main_site += "<td>";
+  main_site += database.minV;
+  main_site += " V</td>";
+  main_site += "<td>";
+  main_site += database.maxV;
+  main_site += " V</td>";
+  main_site += "<td>";
+  main_site += database.delta;
+  main_site += " V</td>";
+  main_site += "<td>";
+  main_site += database.state_of_charge;
+  main_site += " %</td>";
+  main_site += "<td>";
+  main_site += database.charge_current;
+  main_site += " A</td>";
+
+  main_site +=  "</tr>";
+  main_site += "</table><br><br>";
+
+  //Temperatures data
+  main_site += "<table>";
+  main_site += "<tr>\n"
+               "  <th>Thermistor number</th>\n"
+               "  <th>Temperature</th>\n"
+               "</tr>";
+
+  for (int i = 0; i < THERMISTORS_COUNT; ++i) {
+    main_site += "<tr>\n";
+    main_site += "<td>";
+    main_site += i + 1;
+    main_site += "</td>";
+    main_site += "<td>";
+    main_site += database.temperatures[i];
+    main_site += " C</td>";
+    main_site +=  "</tr>";
+  }
+
+  main_site += "</table><br><br>";
+
+  //Voltages Data
+  main_site += "<table>";
+  main_site += "<tr>\n"
+               "  <th>Cell number</th>\n"
+               "  <th>Voltage</th>\n"
+               "  <th>Delta from average</th>"
+               "</tr>";
+
+  for (int i = 0; i < conn_cells; ++i) {
+    main_site += "<tr>\n";
+    main_site += "<td>";
+    main_site += i + 1;
+    main_site += "</td>";
+    main_site += "<td>";
+    main_site += database.cells_voltages[i];
+    main_site += " V</td>";
+    main_site += "<td>";
+    if ((database.cells_voltages[i] - database.average_cell_voltage) > 0.0) main_site += '+';
+    main_site += database.cells_voltages[i] - database.average_cell_voltage;
+    main_site += " V</td>";
+    main_site +=  "</tr>";
+  }
+
+  main_site += "</table><br><br>";
+
+  //System overview
+  byte cbr_1 = getCellBalancingRegisters(1);
+  byte cbr_2 = getCellBalancingRegisters(2);
+  byte cbr_3 = getCellBalancingRegisters(3);
+
+  //Cell balancing
+  //Cells 0-5
+  main_site += "<table>";
+  main_site += "<tr>\n";
+  main_site += "<th> </th>\n";
+
+  for (int i = 1; i <= 5; ++i) {
+    main_site += "<th>Cell ";
+    main_site += i;
+    main_site += " balancing</th>\n";
+  }
+  main_site +=  "</tr>";
+
+  main_site += "<tr>\n"
+               "<td>Key</td>\n";
+  for (int i = 0; i < 5; ++i) {
+    main_site += "<td><a href=\"/?key=cell_balancing_1\">\"cell_balancing_1\"</a>";
+    main_site += " bit ";
+    main_site += i;
+    main_site += "</td>\n";
+  }
+  main_site += "</tr>";
+
+  main_site += "<tr>\n"
+               "<td>State</td>\n";
+  for (int i = 0; i < 5; ++i) {
+    main_site += "<td>";
+    main_site += (cbr_1 & (B00000001 << i)) >> i;
+    main_site += "</td>\n";
+  }
+
+  main_site += "</table><br>";
+
+  //Cells 5-10
+  main_site += "<table>";
+  main_site += "<tr>\n";
+  main_site += "<th> </th>\n";
+
+  for (int i = 6; i <= 10; ++i) {
+    main_site += "<th>Cell ";
+    main_site += i;
+    main_site += " balancing</th>\n";
+  }
+  main_site +=  "</tr>";
+
+  main_site += "<tr>\n"
+               "<td>Key</td>\n";
+  for (int i = 0; i < 5; ++i) {
+    main_site += "<td><a href=\"/?key=cell_balancing_2\">\"cell_balancing_2\"</a>";
+    main_site += " bit ";
+    main_site += i;
+    main_site += "</td>\n";
+  }
+  main_site += "</tr>";
+
+  main_site += "<tr>\n"
+               "<td>State</td>\n";
+  for (int i = 0; i < 5; ++i) {
+    main_site += "<td>";
+    main_site += (cbr_2 & (B00000001 << i)) >> i;
+    main_site += "</td>\n";
+  }
+
+  main_site += "</table><br>";
+
+  //Cells 10-15
+  main_site += "<table>";
+  main_site += "<tr>\n";
+  main_site += "<th> </th>\n";
+
+  for (int i = 11; i <= 15; ++i) {
+    main_site += "<th>Cell ";
+    main_site += i;
+    main_site += " balancing</th>\n";
+  }
+  main_site +=  "</tr>";
+
+  main_site += "<tr>\n"
+               "<td>Key</td>\n";
+  for (int i = 0; i < 5; ++i) {
+    main_site += "<td><a href=\"/?key=cell_balancing_3\">\"cell_balancing_3\"</a>";
+    main_site += " bit ";
+    main_site += i;
+    main_site += "</td>\n";
+  }
+  main_site += "</tr>";
+
+  main_site += "<tr>\n"
+               "<td>State</td>\n";
+  for (int i = 0; i < 5; ++i) {
+    main_site += "<td>";
+    main_site += (cbr_3 & (B00000001 << i)) >> i;
+    main_site += "</td>\n";
+  }
+
+  main_site += "</table><br><br>";
+
+  //Protect registers
+  byte protect1_register_value = (byte)(readRegister(PROTECT1));
+  byte protect2_register_value = (byte)(readRegister(PROTECT2));
+  byte protect3_register_value = (byte)(readRegister(PROTECT3));
+
+  main_site += "<table>";
+  main_site += "<tr>\n"
+               "  <th></th>"
+               "  <th>RSNS</th>\n"
+               "  <th>SCD_D</th>\n"
+               "  <th>SCD_T</th>\n"
+               "  <th>OCD_D</th>\n"
+               "  <th>OCD_T</th>\n"
+               "  <th>UnderVoltage</th>\n"
+               "  <th>OverVoltage</th>\n"
+               "</tr>";
+
+  main_site += "<tr>\n";
+
+  main_site += "<td>Key</td>";
+
+  main_site += "<td><a href=\"/?key=protect_1_rsns\">\"protect_1_rsns\"</a></td>";
+
+  main_site += "<td><a href=\"/?key=protect_1_scd_d\">\"protect_1_scd_d\"</a></td>";
+
+  main_site += "<td><a href=\"/?key=protect_1_scd_t\">\"protect_1_scd_t\"</a></td>";
+
+  main_site += "<td><a href=\"/?key=protect_2_ocd_d\">\"protect_2_ocd_d\"</a></td>";
+
+  main_site += "<td><a href=\"/?key=protect_2_ocd_t\">\"protect_2_ocd_t\"</a></td>";
+
+  main_site += "<td><a href=\"/?key=protect_3_uv\">\"protect_3_uv\"</a></td>";
+
+  main_site += "<td><a href=\"/?key=protect_3_ov\">\"protect_3_ov\"</a></td>";
+
+  main_site += "</tr>";
+
+  main_site += "<tr>\n";
+
+  main_site += "<td>Value</td>";
+
+  main_site += "<td>";
+  main_site += (uint8_t)((protect1_register_value & B10000000) >> 7);
+  main_site += "</td>";
+
+  main_site += "<td>";
+  main_site += (uint8_t)((protect1_register_value & B00011000) >> 3);
+  main_site += "</td>";
+
+  main_site += "<td>";
+  main_site += (uint8_t)(protect1_register_value & B00000111);
+  main_site += "</td>";
+
+  main_site += "<td>";
+  main_site += (uint8_t)((protect2_register_value & B01110000) >> 4);
+  main_site += "</td>";
+
+  main_site += "<td>";
+  main_site += (uint8_t)(protect2_register_value & B00001111);
+  main_site += "</td>";
+
+  main_site += "<td>";
+  main_site += (uint8_t)((protect3_register_value & B11000000) >> 6);
+  main_site += "</td>";
+
+  main_site += "<td>";
+  main_site += (uint8_t)((protect3_register_value & B00110000) >> 4);
+  main_site += "</td>";
+
+  main_site +=  "</tr>";
+  main_site += "</table><br><br>";
+
+  //Overvoltage and undervoltage registers
+  byte ov_trip_register_value = (byte)(readRegister(OV_TRIP));
+  byte uv_trip_register_value = (byte)(readRegister(UV_TRIP));
+
+  main_site += "<table>";
+  main_site += "<tr>\n"
+               "  <th></th>"
+               "  <th>Overvoltage trip</th>\n"
+               "  <th>Undervoltage trip</th>\n"
+               "</tr>";
+
+  main_site += "<tr>\n";
+
+  main_site += "<td>Key</td>";
+
+  main_site += "<td><a href=\"/?key=ov_trip\">\"ov_trip\"</a></td>";
+
+  main_site += "<td><a href=\"/?key=uv_trip\">\"uv_trip\"</a></td>";
+
+  main_site += "</tr>";
+
+  main_site += "<tr>\n";
+
+  main_site += "<td>Value</td>";
+
+  main_site += "<td>";
+  main_site += (uint8_t)(ov_trip_register_value);
+  main_site += "</td>";
+
+  main_site += "<td>";
+  main_site += (uint8_t)(uv_trip_register_value);
+  main_site += "</td>";
+
+  main_site +=  "</tr>";
+  main_site += "</table><br><br>";
+
+  //Alarms
+  main_site += "<table>";
+  main_site += "<tr>\n"
+               "  <th>Alarm type</th>\n"
+               "  <th>Timestamp</th>\n"
+               "</tr>";
+
+
+  for (int i = 0; i < 8; ++i) {
+    String tmp;
+    switch (alarms_database[i].record_type) {
+      case OCD: {
+       tmp = "OCD ERROR";
+        break;
+      }
+      case SCD: {
+        tmp = "SCD ERROR";
+        break;
+      }
+      case OV: {
+        tmp = "OV ERROR";
+        break;
+      }
+      case UV: {
+        tmp = "UV ERROR";
+        break;
+      }
+      case OVRD_ALERT: {
+        tmp = "OVRD ERROR";
+        break;
+      }
+      case DEVICE_XREADY: {
+        tmp = "XREADY ERROR";
+        break;
+      }
+      default: {
+        continue;
+      }
+    }
+    main_site += "<tr>\n";
+
+    main_site += "<td>";
+
+    main_site += tmp;
+
+    main_site += "</td>";
+
+    char time_char_array[64];
+    strftime(time_char_array, sizeof(time_char_array), "%T %d/%m/%G", &alarms_database[i].record_time);
+
+    main_site += "<td>";
+    main_site +=  time_char_array;
+    main_site += "</td>";
+
+    main_site += "</tr>";
+  }
+
+  main_site +=  "</tr>";
+  main_site += "</table><br><br>";
+
+  main_site += "<form action=\"/alarms\" method=\"post\"><br>";
+  main_site += "<input type=\"submit\" value=\"Clear alarms\"></form>";
+
+  main_site += "</body>\n"
+               "</html>";
+
+  return main_site;
+}
+
+//Function that check if parameter supplied to http://<IP>/ is correct
+bool checkParameterKey(String param) {
+  if (param == "cell_balancing_1") return true;
+  if (param == "cell_balancing_2") return true;
+  if (param == "cell_balancing_3") return true;
+
+  if (param == "protect_1_rsns") return true;
+  if (param == "protect_1_scd_d") return true;
+  if (param == "protect_1_scd_t") return true;
+
+  if (param == "protect_2_ocd_d") return true;
+  if (param == "protect_2_ocd_t") return true;
+
+  if (param == "protect_3_uv") return true;
+  if (param == "protect_3_ov") return true;
+
+  if (param == "ov_trip") return true;
+  if (param == "uv_trip") return true;
+
+  return false;
+}
+
 //Function to set config registers on BQ76940
 void setChipValues(ArduinoJson6194_F1::DynamicJsonDocument values) {
   //Modify only fields from JSON
@@ -1036,8 +1448,63 @@ void loadMQTTConfig () {
 void webServerSetup() {
   //Main Page
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-    //TODO: Tables with data
-    request->send(200, "text/plain", bms_name);
+    int num_of_params = request->params();
+    if (num_of_params) {
+      for (int i = 0; i < num_of_params; i++) {
+        AsyncWebParameter* p = request->getParam(i);
+
+        if (p->name() == "key") {
+          if (checkParameterKey(p->value())) {
+            String response_page = "<!DOCTYPE html>\n"
+                                   "<html>\n"
+                                   "<body>\n";
+            response_page += "<form action=\"/\" method=\"get\"><br>";
+
+            response_page += p->value();
+
+            response_page += "<br><input type=\"number\" id=\"";
+            response_page += p->value();
+            response_page += "\" name=\"";
+            response_page += p->value();
+            response_page += "\"><br>";
+
+            response_page += "<br><input type=\"submit\" value=\"Set\">"
+                             "</form>";
+
+            response_page += "</body>\n"
+                             "</html>";
+            request->send(200, "text/html", response_page);
+          }
+        }
+
+        String key = "";
+        uint8_t value;
+        if (checkParameterKey(p->name())) {
+          key = p->name();
+          value = (uint8_t)p->value().toInt();
+
+          ArduinoJson6194_F1::DynamicJsonDocument data(1024);
+          data[key] = value;
+          setChipValues(data);
+
+          String params_set_page = "<!DOCTYPE html>\n"
+                                   "<html>\n"
+                                   "  <body>\n"
+                                   "    <p>Parameter \"";
+          params_set_page += key;
+          params_set_page += "\" set to \"";
+          params_set_page += value;
+          params_set_page += "\"<br><a href=\"/\">Click here to return to Overview</a>\n"
+                             "  </body>\n"
+                             "</html>";
+          request->send(200, "text/html", params_set_page);
+        }
+
+        request->send(400, "text/html", "Key is not found or incorrect");
+      }
+    } else {
+      request->send(200, "text/html", makeHTMLMainSite());
+    }
   });
 
   //Data Page
@@ -1073,7 +1540,8 @@ void webServerSetup() {
     for (int i = 0; i < 8; ++i) {
       alarms_database[i] = tmp;
     }
-    request->send(200, "application/json", makeJsonAlarmsDataPack());
+    alarm_icon_enabled = false;
+    request->send(200, "application/json", "Alarms cleared");
   });
 
   //TODO: DEBUG WHY OTA DOESNT WORK
@@ -1223,15 +1691,17 @@ void secondCoreTaskFunction(void * params) {
 
   if (!ap_mode) {
     //Set timezone than connect to NTP server and get current time
-    time(&current_time);
-    setenv("PL", "GMT+1", 1);
-    tzset();
+    WiFiUDP ntp_udp;
 
-    sntp_setoperatingmode(SNTP_OPMODE_POLL);
-    sntp_setservername(0, "pool.ntp.org");
-    sntp_set_sync_mode(SNTP_SYNC_MODE_IMMED);
-    sntp_set_sync_interval(3600000);
-    sntp_init();
+    NTPClient time_client(ntp_udp);
+    time_client.begin();
+    time_client.setTimeOffset(3600);
+
+    while (!time_client.update()) {
+      time_client.forceUpdate();
+    }
+
+    current_time = time_client.getEpochTime();
 
     tm now{};
     localtime_r(&current_time, &now);
